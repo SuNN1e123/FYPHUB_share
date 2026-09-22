@@ -1,4 +1,5 @@
 from datetime import datetime
+import hashlib
 import io
 import sqlite3
 import fitz  # PyMuPDF
@@ -21,61 +22,46 @@ if OPENROUTER_API_KEY:
     )
   except Exception as e:
     st.error(f"OpenRouter 初始化失敗: {e}")
-else:
-  st.warning(
-      "⚠️ 偵測不到 OPENROUTER_API_KEY，請在 Streamlit Secrets 或設定中配置。"
-  )
 
 
-# --- 初始化與自動升級 SQLite 資料庫 ---
+# --- 初始化與自動升級 SQLite 資料庫（含多用戶與資料隔離） ---
 def init_db():
-  conn = sqlite3.connect("fyp_papers.db", check_same_thread=False)
+  conn = sqlite3.connect("fyp_users_hub.db", check_same_thread=False)
   c = conn.cursor()
 
+  # 1. 用戶表格
+  c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT
+        )
+    """)
+
+  # 2. 分類表格（加上 user_id 隔離）
+  c.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT
+        )
+    """)
+
+  # 3. 文獻表格（加上 user_id 隔離）
   c.execute("""
         CREATE TABLE IF NOT EXISTS papers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             title TEXT,
             authors TEXT,
             year TEXT,
             category TEXT,
-            citation TEXT
+            citation TEXT,
+            pdf_data BLOB,
+            filename TEXT,
+            sort_order INTEGER DEFAULT 0
         )
     """)
-  c.execute("""
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
-        )
-    """)
-
-  c.execute("PRAGMA table_info(papers)")
-  columns = [col[1] for col in c.fetchall()]
-
-  if "pdf_data" not in columns:
-    c.execute("ALTER TABLE papers ADD COLUMN pdf_data BLOB")
-  if "filename" not in columns:
-    c.execute("ALTER TABLE papers ADD COLUMN filename TEXT")
-
-  # 確保 sort_order 欄位存在（用來記錄自訂排序，若未啟用 A-Z 則依 id 排序）
-  if "sort_order" not in columns:
-    c.execute("ALTER TABLE papers ADD COLUMN sort_order INTEGER DEFAULT 0")
-
-  # 僅在資料庫完全沒有任何分類時，才初始化預設分類
-  c.execute("SELECT COUNT(*) FROM categories")
-  count = c.fetchone()[0]
-  if count == 0:
-    default_cats = [
-        "引言 (Introduction)",
-        "方法 (Methodology)",
-        "實驗 (Experiments)",
-        "回收箱 (Trash)",
-    ]
-    for cat in default_cats:
-      c.execute(
-          "INSERT OR IGNORE INTO categories (name) VALUES (?)",
-          (cat,),
-      )
   conn.commit()
   return conn, c
 
@@ -84,7 +70,7 @@ conn, c = init_db()
 
 # 設定網頁排版
 st.set_page_config(
-    page_title="My FYP Research Hub", page_icon="✨", layout="wide"
+    page_title="My FYP Research Hub - 雲端多用戶版", page_icon="✨", layout="wide"
 )
 
 st.markdown("""
@@ -94,14 +80,109 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("✨ My FYP Research Hub ")
+
+# --- 密碼雜湊輔助函數 ---
+def hash_password(password):
+  return hashlib.sha256(password.encode()).hexdigest()
+
+
+# --- 用戶登入與註冊狀態管理 ---
+if "logged_in" not in st.session_state:
+  st.session_state.logged_in = False
+if "username" not in st.session_state:
+  st.session_state.username = ""
+if "user_id" not in st.session_state:
+  st.session_state.user_id = None
+
+# ----------------- 未登入：顯示登入／註冊介面 -----------------
+if not st.session_state.logged_in:
+  st.title("✨ My FYP Research Hub - 登入專屬你的文獻庫")
+  st.caption("每個帳號擁有獨立的分類、文獻與 PDF 雲端儲存空間！")
+
+  auth_tab1, auth_tab2 = st.tabs(["🔑 登入帳號", "📝 註冊新帳號"])
+
+  with auth_tab1:
+    with st.form("login_form"):
+      login_user = st.text_input("用戶名稱 (Username)")
+      login_pass = st.text_input("密碼 (Password)", type="password")
+      login_submitted = st.form_submit_button("登入", type="primary")
+
+      if login_submitted:
+        hashed_pw = hash_password(login_pass)
+        c.execute(
+            "SELECT id FROM users WHERE username = ? AND password = ?",
+            (login_user, hashed_pw),
+        )
+        user_row = c.fetchone()
+        if user_row:
+          st.session_state.logged_in = True
+          st.session_state.username = login_user
+          st.session_state.user_id = user_row[0]
+          st.success(f"歡迎回來，{login_user}！正在進入你的 FYP Hub...")
+          st.rerun()
+        else:
+          st.error("登入失敗：用戶名稱或密碼錯誤。")
+
+  with auth_tab2:
+    with st.form("register_form"):
+      reg_user = st.text_input("設定用戶名稱 (Username)")
+      reg_pass = st.text_input("設定密碼 (Password)", type="password")
+      reg_submitted = st.form_submit_button("註冊並自動建立預設分類", type="primary")
+
+      if reg_submitted:
+        if not reg_user or not reg_pass:
+          st.warning("用戶名稱與密碼不能為空！")
+        else:
+          try:
+            hashed_pw = hash_password(reg_pass)
+            c.execute(
+                "INSERT INTO users (username, password) VALUES (?, ?)",
+                (reg_user, hashed_pw),
+            )
+            conn.commit()
+
+            # 取得新註冊用戶的 id
+            c.execute("SELECT id FROM users WHERE username = ?", (reg_user,))
+            new_uid = c.fetchone()[0]
+
+            # 為新用戶初始化預設分類
+            default_cats = [
+                "引言 (Introduction)",
+                "方法 (Methodology)",
+                "實驗 (Experiments)",
+                "回收箱 (Trash)",
+            ]
+            for cat in default_cats:
+              c.execute(
+                  "INSERT INTO categories (user_id, name) VALUES (?, ?)",
+                  (new_uid, cat),
+              )
+            conn.commit()
+
+            st.success("🎉 註冊成功！請切換到「登入帳號」分頁進行登入。")
+          except sqlite3.IntegrityError:
+            st.error("該用戶名稱已經被註冊，請嘗試其他名稱。")
+
+  st.stop()  # 阻斷後續程式碼，直到用戶成功登入
+
+# ----------------- 已登入：顯示用戶專屬的 FYP Hub -----------------
+current_uid = st.session_state.user_id
+
+st.sidebar.markdown(f"👤 當前用戶：**{st.session_state.username}**")
+if st.sidebar.button("🚪 登出帳號"):
+  st.session_state.logged_in = False
+  st.session_state.username = ""
+  st.session_state.user_id = None
+  st.rerun()
+
+st.title(f"✨ {st.session_state.username}'s FYP Research Hub")
 st.caption(
-    "結合數字序號、標題字母排序、PDF 原件儲存，以及流暢的文獻移動與複製功能，高效管理您的"
-    " FYP 文獻！"
+    "專屬你的文獻管理平台：支援分區卡片檢視、自動序號、A-Z 字母排序、PDF 原件儲存與 AI"
+    " 智能解析。"
 )
 
-# 讀取當前資料庫中的分類
-c.execute("SELECT name FROM categories")
+# 讀取當前用戶專屬的分類
+c.execute("SELECT name FROM categories WHERE user_id = ?", (current_uid,))
 categories = [row[0] for row in c.fetchall()]
 
 tab1, tab2 = st.tabs(["📚 文獻分區資料庫 (Dashboard)", "📤 上載與 AI 智能解析"])
@@ -116,7 +197,7 @@ with tab1:
 
   st.divider()
 
-  # 分類管理區塊（包含建立與刪除）
+  # 分類管理區塊（用戶專屬）
   with st.expander("📁 管理研究分類夾 (新增 / 刪除)"):
     col_add, col_del = st.columns(2)
 
@@ -127,16 +208,20 @@ with tab1:
       )
       if st.button("建立分類"):
         if new_cat:
-          try:
+          c.execute(
+              "SELECT COUNT(*) FROM categories WHERE user_id = ? AND name = ?",
+              (current_uid, new_cat),
+          )
+          if c.fetchone()[0] > 0:
+            st.info("呢個分類已經存在喇！")
+          else:
             c.execute(
-                "INSERT INTO categories (name) VALUES (?)",
-                (new_cat,),
+                "INSERT INTO categories (user_id, name) VALUES (?, ?)",
+                (current_uid, new_cat),
             )
             conn.commit()
             st.success(f"成功新增分類夾：{new_cat}")
             st.rerun()
-          except sqlite3.IntegrityError:
-            st.info("呢個分類已經存在喇！")
         else:
           st.warning("請輸入分類名稱！")
 
@@ -156,23 +241,22 @@ with tab1:
           elif len(categories) <= 1:
             st.warning("最少需要保留一個分類夾，不能全部刪除！")
           else:
-            # 1. 將該分類下的文獻全部搬去「回收箱 (Trash)」
             fallback_cat = "回收箱 (Trash)"
             c.execute(
-                "UPDATE papers SET category = ? WHERE category = ?",
-                (fallback_cat, cat_to_delete),
+                "UPDATE papers SET category = ? WHERE user_id = ? AND category"
+                " = ?",
+                (fallback_cat, current_uid, cat_to_delete),
             )
-            # 2. 確保「回收箱 (Trash)」分類本身存在於 categories 表格中
             c.execute(
-                "INSERT OR IGNORE INTO categories (name) VALUES (?)",
-                (fallback_cat,),
+                "INSERT OR IGNORE INTO categories (user_id, name) VALUES (?,"
+                " ?)",
+                (current_uid, fallback_cat),
             )
-            # 3. 徹底從 categories 表格刪除該分類
             c.execute(
-                "DELETE FROM categories WHERE name = ?", (cat_to_delete,)
+                "DELETE FROM categories WHERE user_id = ? AND name = ?",
+                (current_uid, cat_to_delete),
             )
             conn.commit()
-
             st.success(
                 f"成功刪除分類「{cat_to_delete}」，入面嘅文獻已安全移至「回收箱"
                 " (Trash)」！"
@@ -185,7 +269,6 @@ with tab1:
 
   for cat in categories:
     with st.container():
-      # 標題列與 A-Z 排序按鈕並排
       col_header_title, col_header_btn = st.columns([4, 1])
       with col_header_title:
         st.markdown(
@@ -199,11 +282,10 @@ with tab1:
             "<div style='margin-top: 12px;'>", unsafe_allow_html=True
         )
         if st.button("🔤 按 A-Z 排序", key=f"sort_az_{cat}"):
-          # 查詢該分類下所有文獻並按標題字母排序
           c.execute(
-              "SELECT id FROM papers WHERE category = ? ORDER BY title COLLATE"
-              " NOCASE ASC",
-              (cat,),
+              "SELECT id FROM papers WHERE user_id = ? AND category = ? ORDER"
+              " BY title COLLATE NOCASE ASC",
+              (current_uid, cat),
           )
           sorted_rows = c.fetchall()
           for idx, (p_id,) in enumerate(sorted_rows):
@@ -216,12 +298,11 @@ with tab1:
           st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-      # 讀取文獻（優先根據 sort_order 排序，若相同則按 id 排序）
       query_sql = (
           "SELECT id, title, authors, year, citation, filename, pdf_data FROM"
-          " papers WHERE category = ?"
+          " papers WHERE user_id = ? AND category = ?"
       )
-      params = [cat]
+      params = [current_uid, cat]
 
       if search_query:
         query_sql += " AND (title LIKE ? OR authors LIKE ?)"
@@ -247,12 +328,10 @@ with tab1:
             filename,
             pdf_blob,
         ) in enumerate(cat_papers, 1):
-          # 在 Expander 左側加上數字編號 (例如：1. 2. 3.)
           with st.expander(f"{idx}. 📄 {title} ({year}) — {authors}"):
             st.write(f"**作者：** {authors}")
             st.write(f"**APA 7th Citation：** `{citation}`")
 
-            # 操作按鈕佈局調整
             col_dl, col_move, col_copy, col_del = st.columns([2, 2, 2, 1])
 
             with col_dl:
@@ -277,8 +356,9 @@ with tab1:
               )
               if st.button("🚚 移動", key=f"btn_move_{paper_id}"):
                 c.execute(
-                    "UPDATE papers SET category = ? WHERE id = ?",
-                    (target_move_cat, paper_id),
+                    "UPDATE papers SET category = ? WHERE id = ? AND user_id"
+                    " = ?",
+                    (target_move_cat, paper_id, current_uid),
                 )
                 conn.commit()
                 st.success(f"已成功移動至：{target_move_cat}")
@@ -294,9 +374,10 @@ with tab1:
               )
               if st.button("📋 複製", key=f"btn_copy_{paper_id}"):
                 c.execute(
-                    """INSERT INTO papers (title, authors, year, category, citation, pdf_data, filename, sort_order)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+                    """INSERT INTO papers (user_id, title, authors, year, category, citation, pdf_data, filename, sort_order)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)""",
                     (
+                        current_uid,
                         title,
                         authors,
                         year,
@@ -312,7 +393,10 @@ with tab1:
 
             with col_del:
               if st.button("🗑️ 刪除", key=f"del_{paper_id}"):
-                c.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+                c.execute(
+                    "DELETE FROM papers WHERE id = ? AND user_id = ?",
+                    (paper_id, current_uid),
+                )
                 conn.commit()
                 st.success("已刪除文獻！")
                 st.rerun()
@@ -421,18 +505,19 @@ with tab2:
           "💾 確認無誤並加入資料庫（含 PDF 原件）", type="primary"
       )
       if submitted:
-        # 新增時自動排在最後面 (sort_order 設為當前該分類最大值 + 1)
         c.execute(
-            "SELECT MAX(sort_order) FROM papers WHERE category = ?",
-            (paper_category,),
+            "SELECT MAX(sort_order) FROM papers WHERE user_id = ? AND category"
+            " = ?",
+            (current_uid, paper_category),
         )
         max_order = c.fetchone()[0]
         new_order = 0 if max_order is None else max_order + 1
 
         c.execute(
-            """INSERT INTO papers (title, authors, year, category, citation, pdf_data, filename, sort_order)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO papers (user_id, title, authors, year, category, citation, pdf_data, filename, sort_order)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
+                current_uid,
                 paper_title,
                 paper_authors,
                 paper_year,
