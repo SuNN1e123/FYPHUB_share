@@ -94,7 +94,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("✨ My FYP Research Hub (編號排序 + 字母 A-Z 排序)")
+st.title("✨ My FYP Research Hub ")
 st.caption(
     "結合數字序號、標題字母排序、PDF 原件儲存，以及流暢的文獻移動與複製功能，高效管理您的"
     " FYP 文獻！"
